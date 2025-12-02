@@ -1,0 +1,364 @@
+#!/bin/bash
+set -euo pipefail
+
+if [[ $EUID -ne 0 ]]; then
+    exec sudo "$0" "$@"
+fi
+
+TEXT_RESET='\e[0m'
+TEXT_YELLOW='\e[0;33m'
+TEXT_RED_B='\e[1;31m'
+
+trap 'printf "%b" "$TEXT_RESET"' EXIT
+
+LOG_FILE='/var/log/qay.log'
+FULL_UPGRADE=0
+NON_INTERACTIVE=0
+AUTO_REBOOT_MODE='prompt'
+declare -a UPGRADABLE_PACKAGES=()
+FLATPAK_COUNT=0
+TARGET_USER=${SUDO_USER:-$(id -un)}
+TARGET_HOME=$(getent passwd "$TARGET_USER" | cut -d: -f6 || true)
+
+if [[ -z ${TARGET_HOME} ]]; then
+    TARGET_HOME=$(eval echo "~$TARGET_USER")
+fi
+
+usage() {
+    cat <<'EOF'
+Usage: qay [options]
+
+Options:
+  -f, --full-upgrade     Run "apt-get full-upgrade" in addition to "upgrade".
+  -y, --non-interactive  Enable non-interactive APT mode (assume yes, auto reboot iff needed).
+  -a, --auto-reboot      Reboot automatically after updates when required.
+  -n, --no-reboot        Skip reboot handling entirely.
+  -h, --help             Show this help.
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        -f|--full-upgrade)
+            FULL_UPGRADE=1
+            ;;
+        -y|--non-interactive)
+            NON_INTERACTIVE=1
+            ;;
+        -a|--auto-reboot)
+            if [[ $AUTO_REBOOT_MODE == 'no' ]]; then
+                printf '%s\n' 'Cannot combine --auto-reboot with --no-reboot.' >&2
+                exit 1
+            fi
+            AUTO_REBOOT_MODE='yes'
+            ;;
+        -n|--no-reboot)
+            if [[ $AUTO_REBOOT_MODE == 'yes' ]]; then
+                printf '%s\n' 'Cannot combine --auto-reboot with --no-reboot.' >&2
+                exit 1
+            fi
+            AUTO_REBOOT_MODE='no'
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        *)
+            printf 'Unknown option: %s\n\n' "$1" >&2
+            usage >&2
+            exit 1
+            ;;
+    esac
+    shift
+done
+
+if (( NON_INTERACTIVE )) && [[ $AUTO_REBOOT_MODE == 'prompt' ]]; then
+    AUTO_REBOOT_MODE='yes'
+fi
+
+mkdir -p "$(dirname "$LOG_FILE")"
+touch "$LOG_FILE"
+
+timestamp() {
+    date '+%Y-%m-%d %H:%M:%S'
+}
+
+log_info() {
+    local message=$1
+    printf '%s %s\n' "$(timestamp)" "$message" | tee -a "$LOG_FILE" >/dev/null
+}
+
+announce() {
+    local color=$1
+    shift
+    local message=$*
+    printf '%b%s%b\n' "$color" "$message" "$TEXT_RESET"
+    log_info "$message"
+}
+
+report_snap_summary() {
+    announce "$TEXT_YELLOW" 'Checking Snap installations...'
+    if ! command -v snap >/dev/null 2>&1; then
+        announce "$TEXT_YELLOW" 'Snap not installed; skipping Snap summary.'
+        return
+    fi
+    local snap_body
+    snap_body=$(snap list 2>/dev/null | tail -n +2)
+    if [[ -z $snap_body ]]; then
+        announce "$TEXT_YELLOW" 'Snap is installed but no snaps are present.'
+    else
+        local snap_count
+        snap_count=$(printf '%s\n' "$snap_body" | wc -l)
+        announce "$TEXT_YELLOW" "Snap packages (${snap_count}):"
+        printf '%s\n' "Name\tVersion\tRev\tTracking\tPublisher\tNotes" | tee -a "$LOG_FILE" >/dev/null
+        while IFS= read -r line; do
+            [[ -z $line ]] && continue
+            printf '%s\n' "$line" | tee -a "$LOG_FILE"
+        done <<< "$snap_body"
+    fi
+}
+
+report_flatpak_summary() {
+    announce "$TEXT_YELLOW" 'Checking Flatpak applications...'
+    FLATPAK_COUNT=0
+    if ! command -v flatpak >/dev/null 2>&1; then
+        announce "$TEXT_YELLOW" 'Flatpak not installed; skipping Flatpak summary.'
+        return
+    fi
+    local -a flatpak_apps=()
+    local flatpak_output
+    if [[ $TARGET_USER != root ]]; then
+        flatpak_output=$(sudo -u "$TARGET_USER" -- flatpak list --app --columns=application 2>/dev/null || true)
+    else
+        flatpak_output=$(flatpak list --app --columns=application 2>/dev/null || true)
+    fi
+    if [[ -z $flatpak_output ]]; then
+        announce "$TEXT_YELLOW" 'No Flatpak applications detected.'
+        return
+    fi
+    mapfile -t flatpak_apps < <(printf '%s\n' "$flatpak_output" | sed '/^$/d')
+    if (( ${#flatpak_apps[@]} == 0 )); then
+        announce "$TEXT_YELLOW" 'No Flatpak applications detected.'
+    else
+        FLATPAK_COUNT=${#flatpak_apps[@]}
+        announce "$TEXT_YELLOW" "Flatpak applications (${FLATPAK_COUNT}):"
+        local app
+        for app in "${flatpak_apps[@]}"; do
+            printf '  %s\n' "$app" | tee -a "$LOG_FILE"
+        done
+    fi
+}
+
+report_appimage_summary() {
+    announce "$TEXT_YELLOW" 'Scanning for AppImage files...'
+    local -a search_dirs=(
+        "$TARGET_HOME"
+        "$TARGET_HOME/.local/bin"
+        "$TARGET_HOME/bin"
+        "$TARGET_HOME/Applications"
+        "$TARGET_HOME/Downloads"
+        "$TARGET_HOME/Software"
+        "/opt"
+    )
+    local max_depth=4
+    declare -A seen=()
+    local -a appimage_files=()
+    local dir
+    for dir in "${search_dirs[@]}"; do
+        [[ -d $dir ]] || continue
+        while IFS= read -r -d '' file; do
+            if [[ -z ${seen[$file]+x} ]]; then
+                seen[$file]=1
+                appimage_files+=("$file")
+            fi
+        done < <(find "$dir" -maxdepth "$max_depth" -type f -iname '*.AppImage' -print0 2>/dev/null)
+    done
+    if (( ${#appimage_files[@]} == 0 )); then
+        announce "$TEXT_YELLOW" 'No AppImage files found in default locations.'
+    else
+        announce "$TEXT_YELLOW" "AppImage files (${#appimage_files[@]}):"
+        local img
+        for img in "${appimage_files[@]}"; do
+            printf '  %s\n' "$img" | tee -a "$LOG_FILE"
+        done
+    fi
+}
+
+offer_flatpak_update() {
+    if ! command -v flatpak >/dev/null 2>&1; then
+        return
+    fi
+    if (( FLATPAK_COUNT == 0 )); then
+        announce "$TEXT_YELLOW" 'Flatpak update skipped (no applications detected).'
+        return
+    fi
+    if ! prompt_yes_default_yes 'Run flatpak update now?'; then
+        announce "$TEXT_YELLOW" 'Flatpak update skipped per user request.'
+        return
+    fi
+    local update_cmd=(flatpak update -y)
+    if (( NON_INTERACTIVE )); then
+        update_cmd+=(--noninteractive)
+    fi
+    announce "$TEXT_YELLOW" 'Updating Flatpak applications...'
+    if [[ $TARGET_USER != root ]]; then
+        if ! { sudo -u "$TARGET_USER" -- "${update_cmd[@]}"; } 2>&1 | tee -a "$LOG_FILE"; then
+            announce "$TEXT_RED_B" 'Flatpak update failed.'
+            return
+        fi
+    else
+        if ! { "${update_cmd[@]}"; } 2>&1 | tee -a "$LOG_FILE"; then
+            announce "$TEXT_RED_B" 'Flatpak update failed.'
+            return
+        fi
+    fi
+    announce "$TEXT_YELLOW" 'Flatpak applications updated.'
+}
+
+prompt_yes_default_yes() {
+    local prompt=$1
+    if (( NON_INTERACTIVE )); then
+        log_info "Auto-confirm (non-interactive): $prompt"
+        return 0
+    fi
+    read -rp "$prompt (Y/n): " reply
+    reply=${reply,,}
+    if [[ -z $reply || $reply == y || $reply == yes ]]; then
+        return 0
+    fi
+    return 1
+}
+
+show_available_upgrades() {
+    announce "$TEXT_YELLOW" 'Available package updates:'
+    local output
+    output=$(LC_ALL=C apt list --upgradable 2>/dev/null)
+    if [[ -z $output || $output == 'Listing...' ]]; then
+        announce "$TEXT_YELLOW" 'No upgradable packages found.'
+        log_info 'apt list --upgradable returned empty.'
+    else
+        printf '%s\n' "$output" | tee -a "$LOG_FILE"
+    fi
+}
+
+collect_upgradable_packages() {
+    mapfile -t UPGRADABLE_PACKAGES < <(
+        LC_ALL=C apt list --upgradable 2>/dev/null |
+        awk -F/ 'NR>1 {print $1}'
+    )
+}
+
+APT_ENV=()
+APT_ARGS=(-y)
+
+if (( NON_INTERACTIVE )); then
+    APT_ENV+=(DEBIAN_FRONTEND=noninteractive APT_LISTCHANGES_FRONTEND=none)
+    APT_ARGS+=(-o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold")
+fi
+
+apt_exec() {
+    if (( ${#APT_ENV[@]} )); then
+        env "${APT_ENV[@]}" apt-get "$@" "${APT_ARGS[@]}"
+    else
+        apt-get "$@" "${APT_ARGS[@]}"
+    fi
+}
+
+run_apt_step() {
+    local label=$1
+    shift
+    announce "$TEXT_YELLOW" "$label ..."
+    {
+        apt_exec "$@"
+    } 2>&1 | tee -a "$LOG_FILE"
+    log_info "$label completed"
+}
+
+announce "$TEXT_YELLOW" 'Starting APT maintenance...'
+
+run_apt_step 'APT update' update
+show_available_upgrades
+
+if prompt_yes_default_yes 'Proceed with applying upgrades?'; then
+    run_apt_step 'APT upgrade' upgrade
+
+    if (( FULL_UPGRADE )); then
+        run_apt_step 'APT full-upgrade' full-upgrade
+    fi
+else
+    announce "$TEXT_YELLOW" 'Upgrade step skipped per user request.'
+fi
+
+collect_upgradable_packages
+if (( ${#UPGRADABLE_PACKAGES[@]} )); then
+    announce "$TEXT_YELLOW" "Packages still held back: ${UPGRADABLE_PACKAGES[*]}"
+    if prompt_yes_default_yes 'Attempt to install held packages now?'; then
+        run_apt_step 'APT install held packages' install "${UPGRADABLE_PACKAGES[@]}"
+        collect_upgradable_packages
+    else
+        announce "$TEXT_YELLOW" 'Skipping held package installation.'
+    fi
+fi
+
+if prompt_yes_default_yes 'Proceed with autoremove + autoclean?'; then
+    run_apt_step 'APT autoremove' autoremove
+    run_apt_step 'APT autoclean' autoclean
+else
+    announce "$TEXT_YELLOW" 'Cleanup steps skipped per user request.'
+fi
+
+announce "$TEXT_YELLOW" 'Reviewing alternative package sources...'
+report_snap_summary
+report_flatpak_summary
+offer_flatpak_update
+report_appimage_summary
+
+reboot_required=0
+if [[ -f /var/run/reboot-required ]]; then
+    reboot_required=1
+    announce "$TEXT_RED_B" 'Reboot required!'
+fi
+
+announce "$TEXT_RED_B" 'Update complete.'
+
+prompt_reboot() {
+    while true; do
+        read -rp 'Would you like to reboot now? (y/n): ' yn
+        yn=${yn,,}
+        case $yn in
+            y|yes)
+                log_info 'User accepted reboot prompt.'
+                reboot
+                ;;
+            n|no)
+                log_info 'User declined reboot prompt.'
+                break
+                ;;
+            *)
+                printf '%s\n' 'Please answer yes or no.'
+                ;;
+        esac
+    done
+}
+
+case $AUTO_REBOOT_MODE in
+    yes)
+        if (( reboot_required )); then
+            announce "$TEXT_RED_B" 'Rebooting now as requested...'
+            log_info 'Automatic reboot triggered.'
+            reboot
+        else
+            announce "$TEXT_YELLOW" 'Automatic reboot skipped (not required).'
+        fi
+        ;;
+    no)
+        announce "$TEXT_YELLOW" 'Reboot skipped as requested.'
+        ;;
+    prompt)
+        if (( reboot_required )); then
+            prompt_reboot
+        else
+            announce "$TEXT_YELLOW" 'No reboot required. System is up to date.'
+        fi
+        ;;
+esac
